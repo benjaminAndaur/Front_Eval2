@@ -1,0 +1,64 @@
+name: CI/CD Frontend
+
+# Trigger: solo en push a la rama deploy dentro de este repositorio
+on:
+  push:
+    branches:
+      - deploy
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO_URL: ${{ secrets.ECR_REPO_URL_FRONTEND }}
+
+jobs:
+  build-push-deploy:
+    name: Build → Push ECR → Deploy EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Obtener el código fuente
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # 2. Configurar credenciales AWS usando los secrets del repositorio
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 3. Login en Amazon ECR desde el runner de GitHub
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Construir la imagen Docker del frontend
+      - name: Build imagen Docker
+        run: |
+          docker build -t frontend:latest .
+
+      # 5. Etiquetar y publicar la imagen en ECR con tag latest y SHA del commit
+      - name: Tag y Push a ECR
+        run: |
+          docker tag frontend:latest ${{ secrets.ECR_REPO_URL_FRONTEND }}:latest
+          docker tag frontend:latest ${{ secrets.ECR_REPO_URL_FRONTEND }}:${{ github.sha }}
+          docker push ${{ secrets.ECR_REPO_URL_FRONTEND }}:latest
+          docker push ${{ secrets.ECR_REPO_URL_FRONTEND }}:${{ github.sha }}
+
+      # 6. Desplegar en EC2 via AWS SSM (sin necesidad de SSH abierto)
+      - name: Deploy en EC2 via SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids ${{ secrets.EC2_FRONTEND_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy frontend - commit ${{ github.sha }}" \
+            --parameters commands=[
+              "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}",
+              "docker pull ${{ secrets.ECR_REPO_URL_FRONTEND }}:latest",
+              "docker stop frontend || true",
+              "docker rm frontend || true",
+              "docker run -d --name frontend -p 5000:5000 --restart unless-stopped -e PORT=5000 -e DEBUG=False -e BACKEND_URL=${{ secrets.BACKEND_URL }} -e SECRET_KEY=${{ secrets.SECRET_KEY }} ${{ secrets.ECR_REPO_URL_FRONTEND }}:latest"
+            ] \
+            --region ${{ secrets.AWS_REGION }}
